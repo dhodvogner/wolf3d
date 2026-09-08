@@ -36,6 +36,8 @@ Place data files in one of these locations:
 
 - ``/home/runner/work/wolf3d/wolf3d/wolf3d-rs/data``
 - ``/home/runner/work/wolf3d/wolf3d/wolf3d-rs``
+- current working directory ``./data`` and ``.``
+- executable-relative ``data`` directories
 - a custom directory via ``WOLF3D_DATA_DIR``
 
 Required files for the chosen extension:
@@ -43,6 +45,9 @@ Required files for the chosen extension:
 - ``MAPHEAD.<EXT>``
 - ``GAMEMAPS.<EXT>``
 - ``VSWAP.<EXT>``
+
+File name matching is case-insensitive on supported platforms, so lower-case names like
+``maphead.wl6`` are also accepted.
 
 Build and run
 -------------
