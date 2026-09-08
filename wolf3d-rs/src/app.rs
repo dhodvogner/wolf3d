@@ -1,28 +1,24 @@
+use std::env;
+use std::path::{Path, PathBuf};
+
 use macroquad::prelude::*;
 
 use crate::command::{Command, MoveBackward, MoveForward, TurnLeft, TurnRight};
+use crate::data::{load_assets, GameAssets, TileMap};
 use crate::ecs::{Entity, Transform, World};
 use crate::events::{Event, EventBus, HudEventLog};
 use crate::fsm::{GameState, StateMachine};
 use crate::pool::{ObjectPool, Particle};
 use crate::renderer::Raycaster;
 
-const MAP: &[&str] = &[
-    "##########",
-    "#........#",
-    "#..##....#",
-    "#........#",
-    "#....#...#",
-    "#........#",
-    "##########",
-];
+const DEFAULT_DATA_DIRS: [&str; 2] = ["./data", "."];
 
 pub struct GameContext {
     pub world: World,
     pub player: Entity,
     pub move_speed: f32,
     pub turn_speed: f32,
-    map: &'static [&'static str],
+    pub map: TileMap,
 }
 
 impl GameContext {
@@ -52,16 +48,17 @@ impl GameContext {
         let tx = x.floor() as i32;
         let ty = y.floor() as i32;
 
-        if tx < 0 || ty < 0 || ty as usize >= self.map.len() {
+        if tx < 0 || ty < 0 {
             return true;
         }
 
-        let row = self.map[ty as usize].as_bytes();
-        if tx as usize >= row.len() {
+        let ux = tx as usize;
+        let uy = ty as usize;
+        if ux >= self.map.width || uy >= self.map.height {
             return true;
         }
 
-        row[tx as usize] == b'#'
+        self.map.walls[uy * self.map.width + ux] > 0
     }
 }
 
@@ -69,9 +66,11 @@ pub struct App {
     state_machine: StateMachine,
     events: EventBus,
     context: GameContext,
+    assets: GameAssets,
     renderer: Raycaster,
     particles: ObjectPool<Particle>,
     commands: Vec<Box<dyn Command>>,
+    status_message: String,
 }
 
 impl App {
@@ -79,11 +78,13 @@ impl App {
         let mut events = EventBus::default();
         events.register(Box::new(HudEventLog::default()));
 
+        let (assets, status_message) = load_or_fallback_assets();
+
         let mut world = World::new();
         let player = world.spawn(Transform {
-            x: 2.0,
-            y: 2.0,
-            heading: 0.0,
+            x: assets.map.player_start.x,
+            y: assets.map.player_start.y,
+            heading: assets.map.player_start.heading,
         });
         events.emit(Event::EntitySpawned(player));
 
@@ -93,13 +94,15 @@ impl App {
             context: GameContext {
                 world,
                 player,
-                move_speed: 0.06,
-                turn_speed: 0.045,
-                map: MAP,
+                move_speed: 2.6,
+                turn_speed: 2.2,
+                map: assets.map.clone(),
             },
+            assets,
             renderer: Raycaster::new(),
-            particles: ObjectPool::with_capacity(16),
+            particles: ObjectPool::with_capacity(32),
             commands: Vec::new(),
+            status_message,
         }
     }
 
@@ -143,12 +146,13 @@ impl App {
                 .transform(self.context.player)
                 .copied()
                 .unwrap_or(Transform {
-                    x: 2.0,
-                    y: 2.0,
-                    heading: 0.0,
+                    x: self.assets.map.player_start.x,
+                    y: self.assets.map.player_start.y,
+                    heading: self.assets.map.player_start.heading,
                 });
 
-            self.renderer.render(MAP, player);
+            self.renderer
+                .render(&self.context.map, &self.assets.wall_textures, player);
             self.draw_hud();
             self.events.dispatch();
 
@@ -159,21 +163,25 @@ impl App {
     fn collect_input(&mut self) {
         self.commands.clear();
 
-        if is_key_down(KeyCode::W) {
+        if is_key_down(KeyCode::W) || is_key_down(KeyCode::Up) {
             self.commands.push(Box::new(MoveForward));
         }
-        if is_key_down(KeyCode::S) {
+        if is_key_down(KeyCode::S) || is_key_down(KeyCode::Down) {
             self.commands.push(Box::new(MoveBackward));
         }
-        if is_key_down(KeyCode::A) {
+        if is_key_down(KeyCode::A) || is_key_down(KeyCode::Left) {
             self.commands.push(Box::new(TurnLeft));
         }
-        if is_key_down(KeyCode::D) {
+        if is_key_down(KeyCode::D) || is_key_down(KeyCode::Right) {
             self.commands.push(Box::new(TurnRight));
         }
     }
 
     fn execute_commands(&mut self) {
+        let delta = get_frame_time().clamp(0.0, 0.05);
+        self.context.move_speed = 3.0 * delta;
+        self.context.turn_speed = 2.3 * delta;
+
         for command in self.commands.drain(..) {
             command.execute(&mut self.context);
         }
@@ -191,7 +199,7 @@ impl App {
 
     fn draw_hud(&self) {
         draw_text(
-            "W/S move, A/D turn, Esc pause, Q quit",
+            "WASD/Arrows move & turn, Esc pause, Q quit",
             16.0,
             24.0,
             24.0,
@@ -204,5 +212,101 @@ impl App {
             24.0,
             WHITE,
         );
+        let actors = self.context.map.info.iter().filter(|tile| **tile > 0).count();
+        draw_text(
+            &format!("Map: {}x{} / info tiles: {actors}", self.context.map.width, self.context.map.height),
+            16.0,
+            72.0,
+            22.0,
+            LIGHTGRAY,
+        );
+        draw_text(&self.status_message, 16.0, 96.0, 22.0, LIGHTGRAY);
     }
+}
+
+fn load_or_fallback_assets() -> (GameAssets, String) {
+    for dir in data_search_order() {
+        match load_assets(&dir, 0) {
+            Ok(assets) => {
+                let message = format!(
+                    "Loaded MAPHEAD/GAMEMAPS/VSWAP.{} from {}",
+                    assets.source_extension,
+                    dir.display()
+                );
+                return (assets, message);
+            }
+            Err(_) => continue,
+        }
+    }
+
+    let fallback = fallback_assets();
+    (
+        fallback,
+        "No original data found. Put MAPHEAD/GAMEMAPS/VSWAP in ./data or set WOLF3D_DATA_DIR."
+            .to_string(),
+    )
+}
+
+fn data_search_order() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+
+    if let Ok(path) = env::var("WOLF3D_DATA_DIR") {
+        dirs.push(PathBuf::from(path));
+    }
+
+    for dir in DEFAULT_DATA_DIRS {
+        dirs.push(PathBuf::from(dir));
+    }
+
+    dirs
+}
+
+fn fallback_assets() -> GameAssets {
+    let rows = [
+        "##########",
+        "#........#",
+        "#..##....#",
+        "#........#",
+        "#....#...#",
+        "#........#",
+        "##########",
+    ];
+
+    let width = rows[0].len();
+    let height = rows.len();
+
+    let mut walls = Vec::with_capacity(width * height);
+    for row in rows {
+        for ch in row.bytes() {
+            walls.push(if ch == b'#' { 1 } else { 0 });
+        }
+    }
+
+    let info = vec![0u16; width * height];
+    let map = TileMap {
+        width,
+        height,
+        walls,
+        info,
+        player_start: crate::data::PlayerStart {
+            x: 2.5,
+            y: 2.5,
+            heading: 0.0,
+        },
+    };
+
+    let texture = crate::data::WallTexture {
+        texels: (0..(64 * 64)).map(|i| (i % 255) as u8).collect(),
+    };
+
+    GameAssets {
+        map,
+        wall_textures: vec![texture],
+        source_extension: "FALLBACK".to_string(),
+    }
+}
+
+#[allow(dead_code)]
+fn _abs_repo_path(relative: &str) -> PathBuf {
+    Path::new("/home/runner/work/wolf3d/wolf3d/wolf3d-rs").join(relative)
 }

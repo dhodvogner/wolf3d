@@ -1,5 +1,6 @@
 mod app;
 mod command;
+mod data;
 mod ecs;
 mod events;
 mod fsm;
