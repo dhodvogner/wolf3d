@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -100,10 +101,18 @@ struct MapHeader {
     height: u16,
 }
 
+#[derive(Debug, Clone)]
+struct DataSetFiles {
+    extension: String,
+    maphead: PathBuf,
+    gamemaps: PathBuf,
+    vswap: PathBuf,
+}
+
 pub fn load_assets(data_dir: &Path, map_index: usize) -> Result<GameAssets, DataError> {
-    let extension = detect_extension(data_dir)?;
-    let map = load_map(data_dir, &extension, map_index)?;
-    let wall_textures = load_wall_textures(data_dir, &extension)?;
+    let data_set = detect_data_set(data_dir)?;
+    let map = load_map(&data_set, map_index)?;
+    let wall_textures = load_wall_textures(&data_set)?;
 
     if wall_textures.is_empty() {
         return Err(DataError::InvalidFormat(
@@ -114,29 +123,61 @@ pub fn load_assets(data_dir: &Path, map_index: usize) -> Result<GameAssets, Data
     Ok(GameAssets {
         map,
         wall_textures,
-        source_extension: extension,
+        source_extension: data_set.extension,
     })
 }
 
-fn detect_extension(data_dir: &Path) -> Result<String, DataError> {
+fn detect_data_set(data_dir: &Path) -> Result<DataSetFiles, DataError> {
     let candidates = ["WL6", "WL1", "SDM", "SOD"];
 
     for ext in candidates {
-        let maphead = data_dir.join(format!("MAPHEAD.{ext}"));
-        let gamemaps = data_dir.join(format!("GAMEMAPS.{ext}"));
-        let vswap = data_dir.join(format!("VSWAP.{ext}"));
+        let Some(maphead) = find_case_insensitive_file(data_dir, &format!("MAPHEAD.{ext}")) else {
+            continue;
+        };
+        let Some(gamemaps) = find_case_insensitive_file(data_dir, &format!("GAMEMAPS.{ext}")) else {
+            continue;
+        };
+        let Some(vswap) = find_case_insensitive_file(data_dir, &format!("VSWAP.{ext}")) else {
+            continue;
+        };
 
-        if maphead.is_file() && gamemaps.is_file() && vswap.is_file() {
-            return Ok(ext.to_string());
-        }
+        return Ok(DataSetFiles {
+            extension: ext.to_string(),
+            maphead,
+            gamemaps,
+            vswap,
+        });
     }
 
     Err(DataError::NoSupportedDataSet(data_dir.to_path_buf()))
 }
 
-fn load_map(data_dir: &Path, ext: &str, map_index: usize) -> Result<TileMap, DataError> {
-    let maphead_path = data_dir.join(format!("MAPHEAD.{ext}"));
-    let maphead = read_file(&maphead_path)?;
+fn find_case_insensitive_file(data_dir: &Path, expected_name: &str) -> Option<PathBuf> {
+    let exact = data_dir.join(expected_name);
+    if exact.is_file() {
+        return Some(exact);
+    }
+
+    let entries = fs::read_dir(data_dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+
+        let Some(name) = path.file_name().and_then(OsStr::to_str) else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case(expected_name) {
+            return Some(path);
+        }
+    }
+
+    None
+}
+
+fn load_map(data_set: &DataSetFiles, map_index: usize) -> Result<TileMap, DataError> {
+    let maphead = read_file(&data_set.maphead)?;
 
     if maphead.len() < 2 + MAP_HEADER_COUNT * 4 {
         return Err(DataError::InvalidFormat(
@@ -162,8 +203,7 @@ fn load_map(data_dir: &Path, ext: &str, map_index: usize) -> Result<TileMap, Dat
         )));
     }
 
-    let gamemaps_path = data_dir.join(format!("GAMEMAPS.{ext}"));
-    let gamemaps = read_file(&gamemaps_path)?;
+    let gamemaps = read_file(&data_set.gamemaps)?;
 
     let header = parse_map_header(&gamemaps, map_offset as usize)?;
     let tile_count = header.width as usize * header.height as usize;
@@ -401,9 +441,8 @@ fn detect_player_start(info_plane: &[u16], width: usize, height: usize) -> Playe
     }
 }
 
-fn load_wall_textures(data_dir: &Path, ext: &str) -> Result<Vec<WallTexture>, DataError> {
-    let vswap_path = data_dir.join(format!("VSWAP.{ext}"));
-    let vswap = read_file(&vswap_path)?;
+fn load_wall_textures(data_set: &DataSetFiles) -> Result<Vec<WallTexture>, DataError> {
+    let vswap = read_file(&data_set.vswap)?;
 
     if vswap.len() < 6 {
         return Err(DataError::InvalidFormat(

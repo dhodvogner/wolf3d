@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::env;
 use std::path::{Path, PathBuf};
 
@@ -625,7 +626,11 @@ fn has_line_of_sight_in_context(context: &GameContext, from_x: f32, from_y: f32,
 }
 
 fn load_or_fallback_assets() -> (GameAssets, String) {
+    let mut checked = Vec::new();
+    let mut errors = Vec::new();
+
     for dir in data_search_order() {
+        checked.push(dir.display().to_string());
         match load_assets(&dir, 0) {
             Ok(assets) => {
                 let message = format!(
@@ -635,16 +640,24 @@ fn load_or_fallback_assets() -> (GameAssets, String) {
                 );
                 return (assets, message);
             }
-            Err(_) => continue,
+            Err(error) => {
+                errors.push(format!("{} -> {error}", dir.display()));
+            }
         }
     }
 
     let fallback = fallback_assets();
-    (
-        fallback,
-        "No original data found. Put MAPHEAD/GAMEMAPS/VSWAP in ./data or set WOLF3D_DATA_DIR."
-            .to_string(),
-    )
+    let mut message = format!(
+        "No original data found. Checked: {}. Put MAPHEAD/GAMEMAPS/VSWAP in one checked directory or set WOLF3D_DATA_DIR.",
+        checked.join(", ")
+    );
+
+    if let Some(last_error) = errors.last() {
+        message.push_str(" Last error: ");
+        message.push_str(last_error);
+    }
+
+    (fallback, message)
 }
 
 fn data_search_order() -> Vec<PathBuf> {
@@ -658,7 +671,32 @@ fn data_search_order() -> Vec<PathBuf> {
         dirs.push(PathBuf::from(dir));
     }
 
-    dirs
+    if let Ok(exe) = env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            dirs.push(exe_dir.join("data"));
+            dirs.push(exe_dir.to_path_buf());
+            if let Some(parent) = exe_dir.parent() {
+                dirs.push(parent.join("data"));
+                dirs.push(parent.to_path_buf());
+            }
+        }
+    }
+
+    dedupe_paths(dirs)
+}
+
+fn dedupe_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
+    let mut result = Vec::new();
+
+    for path in paths {
+        let key = path.to_string_lossy().to_string();
+        if seen.insert(key) {
+            result.push(path);
+        }
+    }
+
+    result
 }
 
 fn spawn_enemies(world: &mut World, map: &TileMap) -> Vec<EnemyAgent> {
