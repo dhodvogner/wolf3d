@@ -8,6 +8,8 @@ const PLAYER_SPAWN_MIN: u16 = 19;
 const PLAYER_SPAWN_MAX: u16 = 22;
 const NEAR_TAG: u8 = 0xA7;
 const FAR_TAG: u8 = 0xA8;
+const AREA_TILE: u16 = 107;
+const AMBUSH_TILE: u16 = 106;
 
 #[derive(Debug, Clone)]
 pub struct GameAssets {
@@ -23,6 +25,8 @@ pub struct TileMap {
     pub walls: Vec<u16>,
     pub info: Vec<u16>,
     pub player_start: PlayerStart,
+    pub doors: Vec<DoorSpawn>,
+    pub enemies: Vec<EnemySpawn>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -35,6 +39,32 @@ pub struct PlayerStart {
 #[derive(Debug, Clone)]
 pub struct WallTexture {
     pub texels: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct DoorSpawn {
+    pub x: usize,
+    pub y: usize,
+    pub vertical: bool,
+    pub lock: u8,
+    pub tile: u16,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct EnemySpawn {
+    pub kind: EnemyKind,
+    pub x: f32,
+    pub y: f32,
+    pub patrolling: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum EnemyKind {
+    Guard,
+    Officer,
+    Ss,
+    Dog,
+    Mutant,
 }
 
 #[derive(Debug)]
@@ -144,7 +174,7 @@ fn load_map(data_dir: &Path, ext: &str, map_index: usize) -> Result<TileMap, Dat
         ));
     }
 
-    let walls = decode_plane(
+    let raw_walls = decode_plane(
         &gamemaps,
         header.plane_start[0] as usize,
         header.plane_len[0] as usize,
@@ -160,6 +190,9 @@ fn load_map(data_dir: &Path, ext: &str, map_index: usize) -> Result<TileMap, Dat
         tile_count,
     )?;
 
+    let walls = normalize_wall_plane(&raw_walls);
+    let doors = detect_doors(&walls, header.width as usize, header.height as usize);
+    let enemies = detect_enemies(&info, header.width as usize, header.height as usize);
     let player_start = detect_player_start(&info, header.width as usize, header.height as usize);
 
     Ok(TileMap {
@@ -168,7 +201,107 @@ fn load_map(data_dir: &Path, ext: &str, map_index: usize) -> Result<TileMap, Dat
         walls,
         info,
         player_start,
+        doors,
+        enemies,
     })
+}
+
+fn normalize_wall_plane(raw: &[u16]) -> Vec<u16> {
+    raw.iter()
+        .map(|tile| {
+            if (90..=101).contains(tile) {
+                *tile
+            } else if *tile == AMBUSH_TILE || *tile >= AREA_TILE {
+                0
+            } else {
+                *tile
+            }
+        })
+        .collect()
+}
+
+fn detect_doors(walls: &[u16], width: usize, height: usize) -> Vec<DoorSpawn> {
+    let mut doors = Vec::new();
+
+    for y in 0..height {
+        for x in 0..width {
+            let tile = walls[y * width + x];
+            if !(90..=101).contains(&tile) {
+                continue;
+            }
+
+            let even = tile % 2 == 0;
+            let lock = if even { (tile - 90) / 2 } else { (tile - 91) / 2 } as u8;
+            doors.push(DoorSpawn {
+                x,
+                y,
+                vertical: even,
+                lock,
+                tile,
+            });
+        }
+    }
+
+    doors
+}
+
+fn detect_enemies(info_plane: &[u16], width: usize, height: usize) -> Vec<EnemySpawn> {
+    let mut enemies = Vec::new();
+
+    for y in 0..height {
+        for x in 0..width {
+            let tile = info_plane[y * width + x];
+            if let Some((kind, patrolling)) = decode_enemy_tile(tile) {
+                enemies.push(EnemySpawn {
+                    kind,
+                    x: x as f32 + 0.5,
+                    y: y as f32 + 0.5,
+                    patrolling,
+                });
+            }
+        }
+    }
+
+    enemies
+}
+
+fn decode_enemy_tile(tile: u16) -> Option<(EnemyKind, bool)> {
+    if matches!(tile, 108..=111 | 144..=147 | 180..=183) {
+        return Some((EnemyKind::Guard, false));
+    }
+    if matches!(tile, 112..=115 | 148..=151 | 184..=187) {
+        return Some((EnemyKind::Guard, true));
+    }
+
+    if matches!(tile, 116..=119 | 152..=155 | 188..=191) {
+        return Some((EnemyKind::Officer, false));
+    }
+    if matches!(tile, 120..=123 | 156..=159 | 192..=195) {
+        return Some((EnemyKind::Officer, true));
+    }
+
+    if matches!(tile, 126..=129 | 162..=165 | 198..=201) {
+        return Some((EnemyKind::Ss, false));
+    }
+    if matches!(tile, 130..=133 | 166..=169 | 202..=205) {
+        return Some((EnemyKind::Ss, true));
+    }
+
+    if matches!(tile, 134..=137 | 170..=173 | 206..=209) {
+        return Some((EnemyKind::Dog, false));
+    }
+    if matches!(tile, 138..=141 | 174..=177 | 210..=213) {
+        return Some((EnemyKind::Dog, true));
+    }
+
+    if matches!(tile, 216..=219 | 234..=237 | 252..=255) {
+        return Some((EnemyKind::Mutant, false));
+    }
+    if matches!(tile, 220..=223 | 238..=241 | 256..=259) {
+        return Some((EnemyKind::Mutant, true));
+    }
+
+    None
 }
 
 fn parse_map_header(gamemaps: &[u8], offset: usize) -> Result<MapHeader, DataError> {

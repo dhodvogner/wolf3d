@@ -5,6 +5,8 @@ use crate::fsm::GameState;
 pub enum Event {
     EntitySpawned(Entity),
     StateChanged { from: GameState, to: GameState },
+    DoorUsed,
+    EnemyKilled,
 }
 
 pub trait Observer {
@@ -40,12 +42,13 @@ pub struct HudEventLog {
     lines: Vec<String>,
 }
 
-
 impl Observer for HudEventLog {
     fn on_event(&mut self, event: &Event) {
         let text = match event {
             Event::EntitySpawned(entity) => format!("spawned entity {entity}"),
             Event::StateChanged { from, to } => format!("state: {from:?} -> {to:?}"),
+            Event::DoorUsed => "door interaction".to_string(),
+            Event::EnemyKilled => "enemy eliminated".to_string(),
         };
         self.lines.push(text);
         if self.lines.len() > 6 {

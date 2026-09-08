@@ -20,6 +20,8 @@ Current implementation focus:
 - command pattern for input actions
 - object pool for reusable objects
 - compatibility loader for original ``MAPHEAD``, ``GAMEMAPS``, and ``VSWAP`` data files
+- original map semantics for floors/walls/doors
+- basic enemy extraction and runtime AI/shooting loop
 
 Data compatibility
 ------------------
@@ -55,5 +57,7 @@ Controls
 
 - ``W/S`` or Up/Down: move forward/backward
 - ``A/D`` or Left/Right: turn
+- ``E`` or ``Space``: use/toggle door in front
+- ``Left Ctrl`` or ``Enter``: fire
 - ``Esc``: pause/resume
 - ``Q``: quit

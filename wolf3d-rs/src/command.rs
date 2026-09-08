@@ -8,6 +8,8 @@ pub struct MoveForward;
 pub struct MoveBackward;
 pub struct TurnLeft;
 pub struct TurnRight;
+pub struct UseAction;
+pub struct FireAction;
 
 impl Command for MoveForward {
     fn execute(&self, context: &mut GameContext) {
@@ -30,5 +32,17 @@ impl Command for TurnLeft {
 impl Command for TurnRight {
     fn execute(&self, context: &mut GameContext) {
         context.turn_player(context.turn_speed);
+    }
+}
+
+impl Command for UseAction {
+    fn execute(&self, context: &mut GameContext) {
+        context.request_use();
+    }
+}
+
+impl Command for FireAction {
+    fn execute(&self, context: &mut GameContext) {
+        context.request_fire();
     }
 }
