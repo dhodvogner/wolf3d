@@ -1,200 +1,33 @@
-use std::env;
-use std::path::{Path, PathBuf};
+//! Application entry point and game loop orchestration.
+//!
+//! `App` wires together the subsystems (input → commands → world → AI →
+//! rendering) but contains no simulation logic itself: collision/doors live
+//! in [`crate::world`], enemy AI in [`crate::enemy`], firing in
+//! [`crate::combat`], HUD text in [`crate::hud`], and asset loading in
+//! [`crate::assets`].
 
 use macroquad::prelude::*;
 
+use crate::assets::load_or_fallback_assets;
+use crate::combat::fire_weapon;
 use crate::command::{
     Command, FireAction, MoveBackward, MoveForward, TurnLeft, TurnRight, UseAction,
 };
-use crate::data::{load_assets, DoorSpawn, EnemyKind, GameAssets, TileMap};
+use crate::data::GameAssets;
 use crate::ecs::{Entity, Transform, World};
+use crate::enemy::{self, EnemyAgent, EnemyState};
 use crate::events::{Event, EventBus, HudEventLog};
 use crate::fsm::{GameState, StateMachine};
+use crate::hud::{self, HudStats};
 use crate::pool::{ObjectPool, Particle};
-use crate::renderer::{Billboard, DoorRenderState, Raycaster};
+use crate::renderer::{DoorRenderState, Raycaster};
+use crate::world::{GameContext, door_from_spawn};
 
-const DEFAULT_DATA_DIRS: [&str; 2] = ["./data", "."];
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum DoorState {
-    Closed,
-    Opening,
-    Open,
-    Closing,
-}
-
-#[derive(Clone, Copy)]
-pub struct DoorRuntime {
-    x: usize,
-    y: usize,
-    vertical: bool,
-    lock: u8,
-    tile: u16,
-    open_ratio: f32,
-    state: DoorState,
-    open_timer: f32,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum EnemyState {
-    Idle,
-    Chasing,
-    Dead,
-}
-
-struct EnemyAgent {
-    entity: Entity,
-    kind: EnemyKind,
-    state: EnemyState,
-    hp: i32,
-    attack_timer: f32,
-    patrol_seed: f32,
-}
-
-pub struct GameContext {
-    pub world: World,
-    pub player: Entity,
-    pub move_speed: f32,
-    pub turn_speed: f32,
-    pub map: TileMap,
-    pub doors: Vec<DoorRuntime>,
-    use_requested: bool,
-    fire_requested: bool,
-}
-
-impl GameContext {
-    pub fn move_player(&mut self, amount: f32) {
-        let Some(transform) = self.world.transform(self.player).copied() else {
-            return;
-        };
-
-        let nx = transform.x + transform.heading.cos() * amount;
-        let ny = transform.y + transform.heading.sin() * amount;
-
-        if !self.collides(nx, ny) {
-            if let Some(player) = self.world.transform_mut(self.player) {
-                player.x = nx;
-                player.y = ny;
-            }
-        }
-    }
-
-    pub fn turn_player(&mut self, amount: f32) {
-        if let Some(player) = self.world.transform_mut(self.player) {
-            player.heading += amount;
-        }
-    }
-
-    pub fn request_use(&mut self) {
-        self.use_requested = true;
-    }
-
-    pub fn request_fire(&mut self) {
-        self.fire_requested = true;
-    }
-
-    fn consume_use_request(&mut self) -> bool {
-        let value = self.use_requested;
-        self.use_requested = false;
-        value
-    }
-
-    fn consume_fire_request(&mut self) -> bool {
-        let value = self.fire_requested;
-        self.fire_requested = false;
-        value
-    }
-
-    fn collides(&self, x: f32, y: f32) -> bool {
-        self.is_point_blocked(x, y)
-    }
-
-    fn is_point_blocked(&self, x: f32, y: f32) -> bool {
-        let tx = x.floor() as i32;
-        let ty = y.floor() as i32;
-        self.is_tile_blocked(tx, ty)
-    }
-
-    fn is_tile_blocked(&self, x: i32, y: i32) -> bool {
-        if x < 0 || y < 0 {
-            return true;
-        }
-
-        let ux = x as usize;
-        let uy = y as usize;
-        if ux >= self.map.width || uy >= self.map.height {
-            return true;
-        }
-
-        let tile = self.map.walls[uy * self.map.width + ux];
-        if tile == 0 {
-            return false;
-        }
-
-        if let Some(door) = self.doors.iter().find(|door| door.x == ux && door.y == uy) {
-            return door.open_ratio < 0.95;
-        }
-
-        true
-    }
-
-    fn step_doors(&mut self, dt: f32) {
-        for door in &mut self.doors {
-            match door.state {
-                DoorState::Closed => {}
-                DoorState::Opening => {
-                    door.open_ratio = (door.open_ratio + dt * 1.9).clamp(0.0, 1.0);
-                    if door.open_ratio >= 0.98 {
-                        door.state = DoorState::Open;
-                        door.open_timer = 2.4;
-                    }
-                }
-                DoorState::Open => {
-                    door.open_timer -= dt;
-                    if door.open_timer <= 0.0 {
-                        door.state = DoorState::Closing;
-                    }
-                }
-                DoorState::Closing => {
-                    door.open_ratio = (door.open_ratio - dt * 1.7).clamp(0.0, 1.0);
-                    if door.open_ratio <= 0.02 {
-                        door.open_ratio = 0.0;
-                        door.state = DoorState::Closed;
-                    }
-                }
-            }
-        }
-    }
-
-    fn interact_door_in_front(&mut self) -> bool {
-        let Some(player) = self.world.transform(self.player).copied() else {
-            return false;
-        };
-
-        let look_distance = 0.9;
-        let tx = (player.x + player.heading.cos() * look_distance).floor() as i32;
-        let ty = (player.y + player.heading.sin() * look_distance).floor() as i32;
-
-        if tx < 0 || ty < 0 {
-            return false;
-        }
-
-        let ux = tx as usize;
-        let uy = ty as usize;
-
-        if let Some(door) = self.doors.iter_mut().find(|door| door.x == ux && door.y == uy) {
-            if door.state == DoorState::Open || door.state == DoorState::Opening {
-                door.state = DoorState::Closing;
-                door.open_timer = 0.0;
-            } else {
-                door.state = DoorState::Opening;
-            }
-            return true;
-        }
-
-        false
-    }
-}
+const MOVE_SPEED: f32 = 3.1;
+const TURN_SPEED: f32 = 2.4;
+const MAX_FRAME_DT: f32 = 0.05;
+const FIRE_COOLDOWN: f32 = 0.24;
+const PLAYER_MAX_HEALTH: i32 = 100;
 
 pub struct App {
     state_machine: StateMachine,
@@ -219,16 +52,12 @@ impl App {
         let (assets, status_message) = load_or_fallback_assets();
 
         let mut world = World::new();
-        let player = world.spawn(Transform {
-            x: assets.map.player_start.x,
-            y: assets.map.player_start.y,
-            heading: assets.map.player_start.heading,
-        });
+        let player = spawn_player(&mut world, &assets);
         events.emit(Event::EntitySpawned(player));
 
-        let enemies = spawn_enemies(&mut world, &assets.map);
-        for enemy in &enemies {
-            events.emit(Event::EntitySpawned(enemy.entity));
+        let enemies = enemy::spawn_enemies(&mut world, &assets.map);
+        for agent in &enemies {
+            events.emit(Event::EntitySpawned(agent.entity));
         }
 
         let doors = assets
@@ -239,25 +68,18 @@ impl App {
             .map(door_from_spawn)
             .collect();
 
+        let context = GameContext::new(world, player, assets.map.clone(), doors);
+
         Self {
             state_machine: StateMachine::new(),
             events,
-            context: GameContext {
-                world,
-                player,
-                move_speed: 0.0,
-                turn_speed: 0.0,
-                map: assets.map.clone(),
-                doors,
-                use_requested: false,
-                fire_requested: false,
-            },
+            context,
             assets,
             renderer: Raycaster::new(),
             particles: ObjectPool::with_capacity(48),
             commands: Vec::new(),
             enemies,
-            player_health: 100,
+            player_health: PLAYER_MAX_HEALTH,
             fire_cooldown: 0.0,
             kills: 0,
             status_message,
@@ -265,28 +87,10 @@ impl App {
     }
 
     pub async fn run(&mut self) {
-        let (from, to) = self.state_machine.transition(GameState::Running);
-        self.events.emit(Event::StateChanged { from, to });
+        self.transition_state(GameState::Running);
 
         loop {
-            if is_key_pressed(KeyCode::Escape) {
-                match self.state_machine.state() {
-                    GameState::Running => {
-                        let (from, to) = self.state_machine.transition(GameState::Paused);
-                        self.events.emit(Event::StateChanged { from, to });
-                    }
-                    GameState::Paused => {
-                        let (from, to) = self.state_machine.transition(GameState::Running);
-                        self.events.emit(Event::StateChanged { from, to });
-                    }
-                    _ => {}
-                }
-            }
-
-            if is_key_pressed(KeyCode::Q) || self.player_health <= 0 {
-                let (from, to) = self.state_machine.transition(GameState::Quit);
-                self.events.emit(Event::StateChanged { from, to });
-            }
+            self.handle_state_transitions();
 
             if self.state_machine.state() == GameState::Quit {
                 break;
@@ -299,42 +103,29 @@ impl App {
                 self.update_gameplay();
             }
 
-            let player = self
-                .context
-                .world
-                .transform(self.context.player)
-                .copied()
-                .unwrap_or(Transform {
-                    x: self.assets.map.player_start.x,
-                    y: self.assets.map.player_start.y,
-                    heading: self.assets.map.player_start.heading,
-                });
-
-            let door_states = self
-                .context
-                .doors
-                .iter()
-                .map(|door| DoorRenderState {
-                    x: door.x as i32,
-                    y: door.y as i32,
-                    open_ratio: door.open_ratio,
-                    tile: door.tile,
-                })
-                .collect::<Vec<_>>();
-
-            let billboards = self.enemy_billboards();
-
-            self.renderer.render(
-                &self.context.map,
-                &door_states,
-                &self.assets.wall_textures,
-                player,
-                &billboards,
-            );
-            self.draw_hud();
+            self.render_frame();
             self.events.dispatch();
 
             next_frame().await;
+        }
+    }
+
+    fn transition_state(&mut self, next: GameState) {
+        let (from, to) = self.state_machine.transition(next);
+        self.events.emit(Event::StateChanged { from, to });
+    }
+
+    fn handle_state_transitions(&mut self) {
+        if is_key_pressed(KeyCode::Escape) {
+            match self.state_machine.state() {
+                GameState::Running => self.transition_state(GameState::Paused),
+                GameState::Paused => self.transition_state(GameState::Running),
+                _ => {}
+            }
+        }
+
+        if is_key_pressed(KeyCode::Q) || self.player_health <= 0 {
+            self.transition_state(GameState::Quit);
         }
     }
 
@@ -362,9 +153,9 @@ impl App {
     }
 
     fn execute_commands(&mut self) {
-        let delta = get_frame_time().clamp(0.0, 0.05);
-        self.context.move_speed = 3.1 * delta;
-        self.context.turn_speed = 2.4 * delta;
+        let delta = frame_delta();
+        self.context.move_speed = MOVE_SPEED * delta;
+        self.context.turn_speed = TURN_SPEED * delta;
 
         for command in self.commands.drain(..) {
             command.execute(&mut self.context);
@@ -382,14 +173,19 @@ impl App {
     }
 
     fn update_gameplay(&mut self) {
-        let dt = get_frame_time().clamp(0.0, 0.05);
+        let dt = frame_delta();
 
         self.context.step_doors(dt);
-        self.update_enemies(dt);
+        let damage = enemy::update_enemies(&mut self.context, &mut self.enemies, dt);
+        self.player_health = (self.player_health - damage).max(0);
         self.fire_cooldown = (self.fire_cooldown - dt).max(0.0);
 
+        self.spawn_ambient_particle();
+    }
+
+    fn spawn_ambient_particle(&mut self) {
         let mut particle = self.particles.acquire();
-        if let Some(player) = self.context.world.transform(self.context.player) {
+        if let Some(player) = self.context.player_transform() {
             particle.x = player.x;
             particle.y = player.y;
             particle.ttl = 0.2;
@@ -397,366 +193,75 @@ impl App {
         self.particles.release(particle);
     }
 
-    fn update_enemies(&mut self, dt: f32) {
-        let Some(player) = self.context.world.transform(self.context.player).copied() else {
-            return;
-        };
-
-        for enemy in &mut self.enemies {
-            if enemy.state == EnemyState::Dead {
-                continue;
-            }
-
-            let Some(mut transform) = self.context.world.transform(enemy.entity).copied() else {
-                continue;
-            };
-
-            let dx = player.x - transform.x;
-            let dy = player.y - transform.y;
-            let distance = (dx * dx + dy * dy).sqrt();
-
-            enemy.attack_timer = (enemy.attack_timer - dt).max(0.0);
-
-            if has_line_of_sight_in_context(&self.context, transform.x, transform.y, player.x, player.y) && distance < 9.0 {
-                enemy.state = EnemyState::Chasing;
-            } else if enemy.state == EnemyState::Chasing {
-                enemy.state = EnemyState::Idle;
-            }
-
-            match enemy.state {
-                EnemyState::Idle => {
-                    if enemy.patrol_seed > 0.0 {
-                        transform.heading += dt * 0.6;
-                    }
-                }
-                EnemyState::Chasing => {
-                    if distance > 0.7 {
-                        let speed = match enemy.kind {
-                            EnemyKind::Guard => 1.2,
-                            EnemyKind::Officer => 1.5,
-                            EnemyKind::Ss => 1.7,
-                            EnemyKind::Dog => 1.9,
-                            EnemyKind::Mutant => 1.6,
-                        };
-                        let step = speed * dt;
-                        let nx = transform.x + dx / distance * step;
-                        let ny = transform.y + dy / distance * step;
-                        if !self.context.is_point_blocked(nx, ny) {
-                            transform.x = nx;
-                            transform.y = ny;
-                        }
-                    }
-
-                    if distance < 1.05 && enemy.attack_timer <= 0.0 {
-                        self.player_health = (self.player_health - 5).max(0);
-                        enemy.attack_timer = 0.6;
-                    }
-                }
-                EnemyState::Dead => {}
-            }
-
-            if let Some(slot) = self.context.world.transform_mut(enemy.entity) {
-                *slot = transform;
-            }
-        }
-    }
-
     fn fire_weapon(&mut self) {
         if self.fire_cooldown > 0.0 {
             return;
         }
-        self.fire_cooldown = 0.24;
+        self.fire_cooldown = FIRE_COOLDOWN;
 
-        let Some(player) = self.context.world.transform(self.context.player).copied() else {
-            return;
-        };
-
-        let mut best: Option<(usize, f32)> = None;
-
-        for (index, enemy) in self.enemies.iter().enumerate() {
-            if enemy.state == EnemyState::Dead {
-                continue;
-            }
-
-            let Some(target) = self.context.world.transform(enemy.entity).copied() else {
-                continue;
-            };
-
-            let dx = target.x - player.x;
-            let dy = target.y - player.y;
-            let distance = (dx * dx + dy * dy).sqrt();
-            if distance > 12.0 {
-                continue;
-            }
-
-            let mut delta = dy.atan2(dx) - player.heading;
-            while delta > std::f32::consts::PI {
-                delta -= std::f32::consts::TAU;
-            }
-            while delta < -std::f32::consts::PI {
-                delta += std::f32::consts::TAU;
-            }
-
-            if delta.abs() > 0.13 {
-                continue;
-            }
-
-            if !has_line_of_sight_in_context(&self.context, player.x, player.y, target.x, target.y) {
-                continue;
-            }
-
-            match best {
-                Some((_, best_distance)) if distance >= best_distance => {}
-                _ => best = Some((index, distance)),
-            }
-        }
-
-        if let Some((index, _)) = best {
-            let enemy = &mut self.enemies[index];
-            enemy.hp -= 34;
-            enemy.state = EnemyState::Chasing;
-
-            if enemy.hp <= 0 {
-                enemy.state = EnemyState::Dead;
-                self.kills += 1;
-                self.events.emit(Event::EnemyKilled);
-            }
+        let outcome = fire_weapon(&self.context, &mut self.enemies);
+        if outcome.kill {
+            self.kills += 1;
+            self.events.emit(Event::EnemyKilled);
         }
     }
 
-    fn enemy_billboards(&self) -> Vec<Billboard> {
-        let mut output = Vec::new();
+    fn render_frame(&self) {
+        let player = self.context.player_transform().unwrap_or(Transform {
+            x: self.assets.map.player_start.x,
+            y: self.assets.map.player_start.y,
+            heading: self.assets.map.player_start.heading,
+        });
 
-        for enemy in &self.enemies {
-            if enemy.state == EnemyState::Dead {
-                continue;
-            }
+        let door_states = self
+            .context
+            .doors
+            .iter()
+            .map(|door| DoorRenderState {
+                x: door.x as i32,
+                y: door.y as i32,
+                open_ratio: door.open_ratio,
+                tile: door.tile,
+            })
+            .collect::<Vec<_>>();
 
-            let Some(transform) = self.context.world.transform(enemy.entity).copied() else {
-                continue;
-            };
+        let billboards = enemy::billboards(&self.context, &self.enemies);
 
-            let (color, scale) = match enemy.kind {
-                EnemyKind::Guard => (RED, 0.72),
-                EnemyKind::Officer => (ORANGE, 0.77),
-                EnemyKind::Ss => (PINK, 0.80),
-                EnemyKind::Dog => (BROWN, 0.58),
-                EnemyKind::Mutant => (GREEN, 0.88),
-            };
-
-            output.push(Billboard {
-                x: transform.x,
-                y: transform.y,
-                color,
-                scale,
-            });
-        }
-
-        output
-    }
-
-    fn draw_hud(&self) {
-        draw_text(
-            "WASD/Arrows move, E/Space use door, Ctrl/Enter fire",
-            16.0,
-            24.0,
-            22.0,
-            YELLOW,
+        self.renderer.render(
+            &self.context.map,
+            &door_states,
+            &self.assets.wall_textures,
+            player,
+            &billboards,
         );
-        draw_text(
-            &format!("State: {:?} | HP: {} | Kills: {}", self.state_machine.state(), self.player_health, self.kills),
-            16.0,
-            48.0,
-            22.0,
-            WHITE,
-        );
+
         let enemies_alive = self
             .enemies
             .iter()
             .filter(|enemy| enemy.state != EnemyState::Dead)
             .count();
-        let vertical_doors = self.context.doors.iter().filter(|door| door.vertical).count();
-        let max_lock = self.context.doors.iter().map(|door| door.lock).max().unwrap_or(0);
-        let info_markers = self.context.map.info.iter().filter(|tile| **tile > 0).count();
-        draw_text(
-            &format!(
-                "Enemies: {} | Doors: {} (vertical {}) | Max lock {} | Info markers {}",
+
+        hud::draw(
+            &self.context,
+            &HudStats {
+                state: self.state_machine.state(),
+                player_health: self.player_health,
+                kills: self.kills,
                 enemies_alive,
-                self.context.doors.len(),
-                vertical_doors,
-                max_lock,
-                info_markers
-            ),
-            16.0,
-            72.0,
-            20.0,
-            LIGHTGRAY,
-        );
-        draw_text(
-            &format!("{}", self.status_message),
-            16.0,
-            94.0,
-            20.0,
-            LIGHTGRAY,
+                status_message: &self.status_message,
+            },
         );
     }
 }
 
-fn has_line_of_sight_in_context(context: &GameContext, from_x: f32, from_y: f32, to_x: f32, to_y: f32) -> bool {
-    let dx = to_x - from_x;
-    let dy = to_y - from_y;
-    let distance = (dx * dx + dy * dy).sqrt();
-    if distance <= f32::EPSILON {
-        return true;
-    }
-
-    let step = 0.08;
-    let mut t = 0.0;
-    while t < distance {
-        let x = from_x + dx / distance * t;
-        let y = from_y + dy / distance * t;
-        if context.is_point_blocked(x, y) {
-            return false;
-        }
-        t += step;
-    }
-
-    true
+fn frame_delta() -> f32 {
+    get_frame_time().clamp(0.0, MAX_FRAME_DT)
 }
 
-fn load_or_fallback_assets() -> (GameAssets, String) {
-    for dir in data_search_order() {
-        match load_assets(&dir, 0) {
-            Ok(assets) => {
-                let message = format!(
-                    "Loaded MAPHEAD/GAMEMAPS/VSWAP.{} from {}",
-                    assets.source_extension,
-                    dir.display()
-                );
-                return (assets, message);
-            }
-            Err(_) => continue,
-        }
-    }
-
-    let fallback = fallback_assets();
-    (
-        fallback,
-        "No original data found. Put MAPHEAD/GAMEMAPS/VSWAP in ./data or set WOLF3D_DATA_DIR."
-            .to_string(),
-    )
-}
-
-fn data_search_order() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-
-    if let Ok(path) = env::var("WOLF3D_DATA_DIR") {
-        dirs.push(PathBuf::from(path));
-    }
-
-    for dir in DEFAULT_DATA_DIRS {
-        dirs.push(PathBuf::from(dir));
-    }
-
-    dirs
-}
-
-fn spawn_enemies(world: &mut World, map: &TileMap) -> Vec<EnemyAgent> {
-    map.enemies
-        .iter()
-        .enumerate()
-        .map(|(index, spawn)| {
-            let entity = world.spawn(Transform {
-                x: spawn.x,
-                y: spawn.y,
-                heading: if spawn.patrolling { 1.2 } else { 0.0 },
-            });
-
-            let hp = match spawn.kind {
-                EnemyKind::Guard => 34,
-                EnemyKind::Officer => 44,
-                EnemyKind::Ss => 54,
-                EnemyKind::Dog => 24,
-                EnemyKind::Mutant => 60,
-            };
-
-            EnemyAgent {
-                entity,
-                kind: spawn.kind,
-                state: if spawn.patrolling {
-                    EnemyState::Chasing
-                } else {
-                    EnemyState::Idle
-                },
-                hp,
-                attack_timer: 0.0,
-                patrol_seed: (index % 3) as f32,
-            }
-        })
-        .collect()
-}
-
-fn door_from_spawn(spawn: DoorSpawn) -> DoorRuntime {
-    DoorRuntime {
-        x: spawn.x,
-        y: spawn.y,
-        vertical: spawn.vertical,
-        lock: spawn.lock,
-        tile: spawn.tile,
-        open_ratio: 0.0,
-        state: DoorState::Closed,
-        open_timer: 0.0,
-    }
-}
-
-fn fallback_assets() -> GameAssets {
-    let rows = [
-        "##########",
-        "#........#",
-        "#..##....#",
-        "#........#",
-        "#....#...#",
-        "#........#",
-        "##########",
-    ];
-
-    let width = rows[0].len();
-    let height = rows.len();
-
-    let mut walls = Vec::with_capacity(width * height);
-    for row in rows {
-        for ch in row.bytes() {
-            walls.push(if ch == b'#' { 1 } else { 0 });
-        }
-    }
-
-    let info = vec![0u16; width * height];
-    let map = TileMap {
-        width,
-        height,
-        walls,
-        info,
-        player_start: crate::data::PlayerStart {
-            x: 2.5,
-            y: 2.5,
-            heading: 0.0,
-        },
-        doors: Vec::new(),
-        enemies: Vec::new(),
-    };
-
-    let texture = crate::data::WallTexture {
-        texels: (0..(64 * 64)).map(|i| (i % 255) as u8).collect(),
-    };
-
-    GameAssets {
-        map,
-        wall_textures: vec![texture],
-        source_extension: "FALLBACK".to_string(),
-    }
-}
-
-#[allow(dead_code)]
-fn _abs_repo_path(relative: &str) -> PathBuf {
-    Path::new("/home/runner/work/wolf3d/wolf3d/wolf3d-rs").join(relative)
+fn spawn_player(world: &mut World, assets: &GameAssets) -> Entity {
+    world.spawn(Transform {
+        x: assets.map.player_start.x,
+        y: assets.map.player_start.y,
+        heading: assets.map.player_start.heading,
+    })
 }

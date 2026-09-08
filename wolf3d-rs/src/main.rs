@@ -1,11 +1,16 @@
 mod app;
+mod assets;
+mod combat;
 mod command;
 mod data;
 mod ecs;
+mod enemy;
 mod events;
 mod fsm;
+mod hud;
 mod pool;
 mod renderer;
+mod world;
 
 use app::App;
 

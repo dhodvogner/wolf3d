@@ -1,0 +1,2 @@
+    Finished `release` profile [optimized] target(s) in 0.14s
+     Running `target\release\wolf3d-rs.exe`

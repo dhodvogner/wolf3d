@@ -139,9 +139,7 @@ fn load_map(data_dir: &Path, ext: &str, map_index: usize) -> Result<TileMap, Dat
     let maphead = read_file(&maphead_path)?;
 
     if maphead.len() < 2 + MAP_HEADER_COUNT * 4 {
-        return Err(DataError::InvalidFormat(
-            "MAPHEAD is too short".to_string(),
-        ));
+        return Err(DataError::InvalidFormat("MAPHEAD is too short".to_string()));
     }
 
     let rlew_tag = read_u16(&maphead, 0)?;
@@ -231,7 +229,11 @@ fn detect_doors(walls: &[u16], width: usize, height: usize) -> Vec<DoorSpawn> {
             }
 
             let even = tile % 2 == 0;
-            let lock = if even { (tile - 90) / 2 } else { (tile - 91) / 2 } as u8;
+            let lock = if even {
+                (tile - 90) / 2
+            } else {
+                (tile - 91) / 2
+            } as u8;
             doors.push(DoorSpawn {
                 x,
                 y,
@@ -360,7 +362,8 @@ fn decode_plane(
     }
 
     let compressed = &gamemaps[plane_start..end];
-    let expanded_words_len = read_u16(compressed, 0)? as usize;
+    let expanded_bytes_len = read_u16(compressed, 0)? as usize;
+    let expanded_words_len = expanded_bytes_len / 2;
     let carmack = carmack_expand(&compressed[2..], expanded_words_len)?;
 
     if carmack.is_empty() {
@@ -541,7 +544,11 @@ fn carmack_expand(input: &[u8], expanded_words: usize) -> Result<Vec<u16>, DataE
     Ok(out)
 }
 
-fn rlew_expand(source: &[u16], rlew_tag: u16, expanded_words: usize) -> Result<Vec<u16>, DataError> {
+fn rlew_expand(
+    source: &[u16],
+    rlew_tag: u16,
+    expanded_words: usize,
+) -> Result<Vec<u16>, DataError> {
     let mut out = Vec::with_capacity(expanded_words);
     let mut i = 0usize;
 
@@ -583,16 +590,22 @@ fn read_file(path: &Path) -> Result<Vec<u8>, DataError> {
 }
 
 fn read_u16(data: &[u8], index: usize) -> Result<u16, DataError> {
-    let bytes = data
-        .get(index..index + 2)
-        .ok_or_else(|| DataError::InvalidFormat("u16 read out of bounds".to_string()))?;
+    let bytes = data.get(index..index + 2).ok_or_else(|| {
+        DataError::InvalidFormat(format!(
+            "u16 read out of bounds at {index} (len {})",
+            data.len()
+        ))
+    })?;
     Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
 }
 
 fn read_u32(data: &[u8], index: usize) -> Result<u32, DataError> {
-    let bytes = data
-        .get(index..index + 4)
-        .ok_or_else(|| DataError::InvalidFormat("u32 read out of bounds".to_string()))?;
+    let bytes = data.get(index..index + 4).ok_or_else(|| {
+        DataError::InvalidFormat(format!(
+            "u32 read out of bounds at {index} (len {})",
+            data.len()
+        ))
+    })?;
     Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 

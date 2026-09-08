@@ -1,4 +1,4 @@
-use crate::app::GameContext;
+use crate::world::GameContext;
 
 pub trait Command {
     fn execute(&self, context: &mut GameContext);
